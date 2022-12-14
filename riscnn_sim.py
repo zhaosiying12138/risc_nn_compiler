@@ -75,20 +75,35 @@ def riscnn_store(local_mem, global_mem, global_lda, get_local_baseaddr, handle):
                 C_local_addr = get_local_baseaddr("C_local", i1, i0, m)
                 print(f"STORE [{C_local_addr}], " + "{" + f"{global_offset}" + "}", file=handle)
 
-def riscnn_flow_to(local_mem, shared_mem):
-    shared_mem[:] = local_mem[:]
-
-def riscnn_flow_from(local_mem, shared_mem):
-# Empty Implementation in real hardware since PE flow directly to local memory
-    local_mem[:] = shared_mem[:]
+@riscnn_prim_func()
+def riscnn_flow_to(local_mem, shared_mem, block_id, local_name, remote_name, get_local_baseaddr, get_remote_baseaddr, handle):
+    if (not MODEL_COMPILE):
+        shared_mem[:] = local_mem[:]
+    else:
+        print(f"// riscnn_flow to PE({block_id})", file=handle)
+        [m, n] = local_mem.shape
+        for i0 in range(n):
+            for i1 in range(m):
+                local_addr = get_local_baseaddr(local_name, i1, i0, m)
+                remote_addr = get_remote_baseaddr(remote_name, i1, i0, m)
+                print(f"FLOW [{local_addr}], ({block_id}), [{remote_addr}]", file=handle)
 
 @riscnn_prim_func()
-def riscnn_set_ldst_base(block_id, ld_baseaddr_a, ld_baseaddr_b, st_baseaddr):
+def riscnn_flow_from(local_mem, shared_mem):
     if (not MODEL_COMPILE):
-        pass
+        # Empty Implementation in real hardware since PE flow directly to local memory
+        local_mem[:] = shared_mem[:]
+
+@riscnn_prim_func(dict={}, once = 1)
+def riscnn_set_ldst_base(block_id, ld_baseaddr_a, ld_baseaddr_b, st_baseaddr, handle):
+    if (not MODEL_COMPILE):
+        if (None is riscnn_set_ldst_base.dict.get(block_id)):
+            riscnn_set_ldst_base.dict[block_id] = []
+        riscnn_set_ldst_base.dict[block_id].append({ld_baseaddr_a, ld_baseaddr_b, st_baseaddr})
     else:
-        print(f"block_id {block_id}: {ld_baseaddr_a}, {ld_baseaddr_b}, {st_baseaddr}")
-    pass
+        if (riscnn_set_ldst_base.once == 1):
+            print(riscnn_set_ldst_base.dict, file=handle)
+            riscnn_set_ldst_base.once = 0
 
 @riscnn_prim_func()
 def riscnn_if(cond, fn1, args1, handle):
@@ -116,6 +131,7 @@ def riscnn_if_else(cond, fn1, args1, fn2, args2, handle):
         print("// Sparse Vector UnSet", file=handle)
 
 class ExeBlock(object):
+    static_ldstf = None
     def __init__(self, A_global: np.ndarray, B_global: np.ndarray, C_global: np.ndarray) -> None:
         self.global_mem_size = 0
         self.global_mem_symbol = {}
@@ -128,6 +144,9 @@ class ExeBlock(object):
         self.declare_global_mem(self.B_global, "B_global")
         self.declare_global_mem(self.C_global, "C_global")
         self.succ = []
+        if (None is ExeBlock.static_ldstf):
+            ExeBlock.static_ldstf = open("RiscNN_LDSTConf.txt", "w")
+            print("// RISC-NN Load and Store Base Address Configuration\n", file=ExeBlock.static_ldstf)
 
     def declare_global_mem(self, mem, name):
         self.global_mem_symbol[name] = self.global_mem_size
@@ -150,8 +169,9 @@ class ExeBlock(object):
         self.succ.append(succ_exb)
 
     def callnext(self, i, j):
-        for exb in self.succ:
-            exb.run(i, j)
+        if (not MODEL_COMPILE):
+            for exb in self.succ:
+                exb.run(i, j)
 
 class ExeBlockA(ExeBlock):
     static_f = None
@@ -172,14 +192,15 @@ class ExeBlockA(ExeBlock):
         self.declare_local_mem(self.B_local, "B_local")
         self.declare_local_mem(self.C_local, "C_local")
         self.declare_local_mem(None, "Tmp_local")
-        print("ExeBlock_A: " + str(self.local_mem_symbol))
+        print(f"ExeBlock_A({block_id}): " + str(self.local_mem_symbol))
 
     # i & j are Iterators(or placeholder)
     def run(self, i: int, j: int):
     # Set LD_BASE & ST_BASE according to iterator i & j
         riscnn_set_ldst_base(self.block_id, self.get_global_baseaddr("A_global", self.block_id * Mc, i * Kc, M),
                                 self.get_global_baseaddr("B_global", i * Kc, j * Nr, K),
-                                self.get_global_baseaddr("C_global", self.block_id * Mc, j * Nr, M))
+                                self.get_global_baseaddr("C_global", self.block_id * Mc, j * Nr, M),
+                                ExeBlock.static_ldstf)
     # Load Stage
         riscnn_if(j == 0, riscnn_load,
             [self.A_local[:], self.A_global[self.block_id * Mc : self.block_id * Mc + Mc, i * Kc : i * Kc + Kc], "A", M, self.get_local_baseaddr, ExeBlockA.static_f],
@@ -192,13 +213,14 @@ class ExeBlockA(ExeBlock):
     # Cal Stage
         riscnn_mat_muladd(self.C_local, self.A_local, self.B_local, self.get_local_baseaddr, ExeBlockA.static_f)
     # Flow Stage
-        riscnn_flow_to(self.B_local, self.B_shared)
+        for exb_succ in self.succ:
+            riscnn_flow_to(self.B_local, self.B_shared, exb_succ.block_id,
+                "B_local", "B_local", self.get_local_baseaddr, exb_succ.get_local_baseaddr, ExeBlockA.static_f)
     # Store Stage
         riscnn_store(self.C_local[:,:], self.C_global[self.block_id * Mc : self.block_id * Mc + Mc, j * Nr : j * Nr + Nr], M,
                         self.get_local_baseaddr, ExeBlockA.static_f)
 
-        if (not MODEL_COMPILE):
-            self.callnext(i, j)
+        self.callnext(i, j)
 
 class ExeBlockB(ExeBlock):
     static_f = None
@@ -218,14 +240,15 @@ class ExeBlockB(ExeBlock):
         self.declare_local_mem(self.A_local, "A_local")
         self.declare_local_mem(self.B_local, "B_local")
         self.declare_local_mem(None, "Tmp_local")
-        print("ExeBlock_B: " + str(self.local_mem_symbol))
+        print(f"ExeBlock_B({block_id}): " + str(self.local_mem_symbol))
 
     def run(self, i: int, j: int):
     # Set LD_BASE & ST_BASE according to iterator i & j
         riscnn_set_ldst_base(self.block_id,
                                 self.get_global_baseaddr("A_global", self.block_id * Mc, i * Kc, M),
                                 self.get_global_baseaddr("B_global", i * Kc, j * Nr, K),
-                                self.get_global_baseaddr("C_global", self.block_id * Mc, j * Nr, M))
+                                self.get_global_baseaddr("C_global", self.block_id * Mc, j * Nr, M),
+                                ExeBlock.static_ldstf)
     # Load Stage
         riscnn_if(j == 0, riscnn_load,
             [self.A_local[:], self.A_global[self.block_id * Mc : self.block_id * Mc + Mc, i * Kc : i * Kc + Kc], "A", M, self.get_local_baseaddr, ExeBlockB.static_f],
@@ -241,8 +264,7 @@ class ExeBlockB(ExeBlock):
         riscnn_store(self.C_local[:,:], self.C_global[self.block_id * Mc : self.block_id * Mc + Mc, j * Nr : j * Nr + Nr],
                         M, self.get_local_baseaddr, ExeBlockB.static_f)
 
-        if (not MODEL_COMPILE):
-            self.callnext(i, j)
+        self.callnext(i, j)
 
 def risc_nn_sim():
     dtype = "float32"
@@ -275,6 +297,6 @@ def risc_nn_sim():
     ebA.run(0, 0)
     ebB.run(0, 0)
 
-    print("Success!")
+    print("Build Success!")
 
 __main__ = risc_nn_sim()
