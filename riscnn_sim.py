@@ -1,7 +1,7 @@
 import numpy as np
 
-#M = 128; N = 64; K = 64; Mc = 8; Kc = 8; Nr = 2
-M = 16; N = 4; K = 16; Mc = 8; Kc = 8; Nr = 2
+M = 128; N = 64; K = 64; Mc = 8; Kc = 8; Nr = 2
+#M = 16; N = 4; K = 16; Mc = 8; Kc = 8; Nr = 2
 MODEL_COMPILE = False
 
 def riscnn_prim_func(**kwargs):
@@ -105,6 +105,7 @@ def riscnn_set_ldst_base(block_id, ld_baseaddr_a, ld_baseaddr_b, st_baseaddr, ha
             print(riscnn_set_ldst_base.dict, file=handle)
             riscnn_set_ldst_base.once = 0
 
+#TODO: Gather the Sparse Vector Instance
 @riscnn_prim_func()
 def riscnn_if(cond, fn1, args1, handle):
     if (not MODEL_COMPILE):
@@ -115,6 +116,7 @@ def riscnn_if(cond, fn1, args1, handle):
         fn1(*args1);
         print("// Sparse Vector UnSet", file=handle)
 
+#TODO: Gather the Sparse Vector Instance
 @riscnn_prim_func()
 def riscnn_if_else(cond, fn1, args1, fn2, args2, handle):
     if (not MODEL_COMPILE):
@@ -132,6 +134,7 @@ def riscnn_if_else(cond, fn1, args1, fn2, args2, handle):
 
 class ExeBlock(object):
     static_ldstf = None
+    static_exbkind = {}
     def __init__(self, A_global: np.ndarray, B_global: np.ndarray, C_global: np.ndarray) -> None:
         self.global_mem_size = 0
         self.global_mem_symbol = {}
@@ -153,7 +156,6 @@ class ExeBlock(object):
         self.global_mem_size += mem.size * 4    # 4 is the size of float32
 
     def get_global_baseaddr(self, name, row_start, col_start, lda) -> int:
-        #print(f"{name}: ({row_start}, {col_start}), lda={lda}")
         return self.global_mem_symbol[name] + (row_start + col_start * lda) * 4
 
     def declare_local_mem(self, mem, name):
@@ -162,16 +164,24 @@ class ExeBlock(object):
             self.local_mem_size += mem.size * 4
 
     def get_local_baseaddr(self, name, row_start, col_start, lda) -> int:
-        #print(f"{name}: ({row_start}, {col_start}), lda={lda}")
         return self.local_mem_symbol[name] + (row_start + col_start * lda) * 4
 
     def connect(self, succ_exb):
         self.succ.append(succ_exb)
+        if (None is ExeBlock.static_exbkind.get(type(succ_exb))):
+            ExeBlock.static_exbkind[type(succ_exb)] = succ_exb
 
     def callnext(self, i, j):
         if (not MODEL_COMPILE):
             for exb in self.succ:
                 exb.run(i, j)
+
+    def compile(self):
+        global MODEL_COMPILE
+        MODEL_COMPILE = True
+        for key in ExeBlock.static_exbkind:
+            exb = ExeBlock.static_exbkind.get(key)
+            exb.run(0, 0)
 
 class ExeBlockA(ExeBlock):
     static_f = None
@@ -179,7 +189,7 @@ class ExeBlockA(ExeBlock):
         super().__init__(env.A_global, env.B_global, env.C_global)
         self.block_id = block_id
         self.B_shared = B_shared
-        print(self.global_mem_symbol)
+        print("Global Memory Layout: " + str(self.global_mem_symbol))
         if (None is ExeBlockA.static_f):
             ExeBlockA.static_f = open("ExeBlockA_ASM.txt", "w")
             print("// ExeBlockA ASM\n", file=ExeBlockA.static_f)
@@ -274,29 +284,22 @@ def risc_nn_sim():
     c_global = np.random.rand(M, N).astype(dtype) # c_global = np.empty((M, N), dtype)
     c_ref = a_global @ b_global
     
-    # Compute Graph
+    # Compute Graph Construction
     env = ExeBlock(a_global, b_global, c_global)
     b_shared = np.empty((Kc, Nr), dtype)
     ebA = ExeBlockA(0, env, b_shared)
     ebBs = []
     for block_id in range(1, M // Mc):
         ebBs.append(ExeBlockB(block_id, env, b_shared))
+    env.connect(ebA)
     for ebB in ebBs:
         ebA.connect(ebB)
-    env.connect(ebA)
-
     for i_k in range(K // Kc):
         for i_n in range(N // Nr):
             env.callnext(i_k, i_n)
-
     np.testing.assert_allclose(c_global, a_global @ b_global, rtol=1e-5)
-
-    global MODEL_COMPILE
-    MODEL_COMPILE = True
-
-    ebA.run(0, 0)
-    ebB.run(0, 0)
-
+    
+    env.compile()
     print("Build Success!")
 
 __main__ = risc_nn_sim()
